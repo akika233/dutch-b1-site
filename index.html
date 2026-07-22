@@ -380,12 +380,19 @@
     .role-object { background: #dff5e4; color: #1f6b3a; }
     .role-complement { background: #efe3ff; color: #5b3d91; }
     .role-conjunction { background: #ececec; color: #555; }
-    .role-other { background: transparent; color: inherit; padding: 0; margin: 0; }
+    .role-determiner { background: #fff0bf; color: #7a5b00; }
+    .role-preposition { background: #ffe8f1; color: #8a3060; }
+    .role-adverb { background: #e0f7f4; color: #0f5c55; }
+    .role-particle { background: #f3e6d8; color: #6b4a2e; }
+    .role-other { background: #f2f2f2; color: #444; }
     .legend-subject { background: #d9ecff; color: #1d4f91; }
     .legend-verb { background: #ffe1cc; color: #9a3f0c; }
     .legend-object { background: #dff5e4; color: #1f6b3a; }
     .legend-complement { background: #efe3ff; color: #5b3d91; }
     .legend-conjunction { background: #ececec; color: #555; }
+    .legend-determiner { background: #fff0bf; color: #7a5b00; }
+    .legend-preposition { background: #ffe8f1; color: #8a3060; }
+    .legend-adverb { background: #e0f7f4; color: #0f5c55; }
     .seg-btn.active {
       background: var(--ink);
       color: #fffdf8;
@@ -643,6 +650,7 @@
             </div>
             <div class="btn-row">
               <button class="btn primary" type="button" id="buildScript">Build script for track</button>
+              <button class="btn" type="button" id="rebuildScript">Rebuild complete</button>
               <a id="pdfOpenTab" href="#" target="_blank" rel="noopener">Open book tab</a>
             </div>
           </div>
@@ -999,22 +1007,64 @@
           <span class="legend-object">object</span>
           <span class="legend-complement">complement</span>
           <span class="legend-conjunction">conjunction</span>
+          <span class="legend-determiner">determiner</span>
+          <span class="legend-preposition">preposition</span>
+          <span class="legend-adverb">adverb</span>
         </div>`;
       const title = data.title ? `<h3 style="margin:0 0 0.7rem;font-family:Fraunces,serif;">${escapeHtml(data.title)}</h3>` : "";
       const cards = data.sentences.map((s, i) => {
-        let nlHtml = "";
-        if (s.tokens && s.tokens.length) {
-          nlHtml = s.tokens.map((t) => {
-            const role = (t.role || "other").toLowerCase();
-            const cls = ["subject", "verb", "object", "complement", "conjunction"].includes(role) ? role : "other";
-            return `<span class="tok role-${cls}">${escapeHtml(t.text)}</span>`;
-          }).join(" ");
-        } else {
-          nlHtml = escapeHtml(s.nl || "");
-        }
+        const tokens = completeTokens(s);
+        const nlHtml = tokens.map((t) => {
+          const role = (t.role || "other").toLowerCase();
+          const allowed = ["subject","verb","object","complement","conjunction","determiner","preposition","adverb","particle","other"];
+          const cls = allowed.includes(role) ? role : "other";
+          return `<span class="tok role-${cls}">${escapeHtml(t.text)}</span>`;
+        }).join(" ");
         return `<article class="sent"><div class="nl"><small style="color:var(--muted);font-weight:700;">${i + 1}.</small> ${nlHtml}</div><div class="en">${escapeHtml(s.en || "")}</div></article>`;
       }).join("");
       wrap.innerHTML = title + legend + cards;
+    }
+
+    function guessRole(word) {
+      const w = word.toLowerCase().replace(/[.,!?;:"""']/g, "");
+      const determiners = new Set(["de","het","een","mijn","jouw","haar","ons","onze","jullie","hun","die","deze","dit","elk","elke","geen"]);
+      const preps = new Set(["voor","in","op","met","naar","van","aan","bij","over","onder","tussen","tegen","door","tot","uit"]);
+      const conjs = new Set(["en","maar","of","want","omdat","terwijl","dat","als","dus","toch"]);
+      const adverbs = new Set(["nou","later","hier","daar","nu","nog","al","erg","heel","zeker","misschien","graag","ook"]);
+      // conjunction before determiner so "dat"/"als" default to linking words
+      if (conjs.has(w)) return "conjunction";
+      if (determiners.has(w)) return "determiner";
+      if (preps.has(w)) return "preposition";
+      if (adverbs.has(w)) return "adverb";
+      return "other";
+    }
+
+    function completeTokens(sentence) {
+      const nl = (sentence.nl || "").trim();
+      let tokens = (sentence.tokens || []).map((t) => ({ text: t.text, role: t.role || "other" }));
+      // If tokens miss words from nl, rebuild from nl words and merge known roles
+      const words = nl.match(/(\S+)/g) || [];
+      if (!words.length) return tokens;
+      const roleByNorm = {};
+      tokens.forEach((t) => {
+        const norm = String(t.text || "").toLowerCase();
+        if (norm) roleByNorm[norm] = t.role;
+      });
+      // Prefer word-aligned complete coverage
+      if (tokens.length < words.length || tokens.some((t) => !t.role || t.role === "other")) {
+        tokens = words.map((w) => {
+          const norm = w.toLowerCase();
+          const existing = roleByNorm[norm] || roleByNorm[w];
+          const role = (existing && existing !== "other") ? existing : guessRole(w);
+          return { text: w, role };
+        });
+      } else {
+        tokens = tokens.map((t) => ({
+          text: t.text,
+          role: (!t.role || t.role === "other") ? guessRole(t.text) : t.role,
+        }));
+      }
+      return tokens;
     }
 
     function escapeHtml(s) {
@@ -1046,9 +1096,9 @@
       }
       const dataB64 = btoa(binary);
       const models = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-2.0-flash"];
-      const prompt = `You are a Dutch B1 tutor. Listen to this Dutch audio.
-Return ONLY JSON: {"title":"...","sentences":[{"nl":"...","en":"...","tokens":[{"text":"...","role":"subject|verb|object|complement|conjunction|other"}]}]}
-Color roles: subject=onderwerp, verb=persoonsvorm, object=voorwerp, complement=rest that completes meaning, conjunction=linking words.`;
+      const prompt = `You are a Dutch B1 tutor. Transcribe the FULL Dutch audio (every sentence/turn, no skipping).
+Return ONLY JSON: {"title":"...","sentences":[{"nl":"full sentence","en":"English","tokens":[{"text":"word","role":"subject|verb|object|complement|conjunction|determiner|preposition|adverb|particle|other"}]}]}
+STRICT: tokens must include EVERY word in nl (de/het/een/mijn/nou/voor/etc). Roles: subject, verb, object, complement, conjunction, determiner (de,het,een,mijn...), preposition (voor,in,op...), adverb (nou,later...), particle, other.`;
       let lastErr = null;
       for (const model of models) {
         try {
@@ -1092,9 +1142,12 @@ Color roles: subject=onderwerp, verb=persoonsvorm, object=voorwerp, complement=r
         renderScript(scriptCache[key]);
         return;
       }
-      wrap.innerHTML = `<div class="script-empty">Building script + English + structure…</div>`;
+      if (force) delete scriptCache[key];
+      wrap.innerHTML = `<div class="script-empty">Building complete script + English + structure…</div>`;
       const btn = document.getElementById("buildScript");
+      const rebuildBtn = document.getElementById("rebuildScript");
       btn.disabled = true;
+      if (rebuildBtn) rebuildBtn.disabled = true;
       try {
         let data = null;
         // Prefer local server cache/analyze when available
@@ -1114,10 +1167,12 @@ Color roles: subject=onderwerp, verb=persoonsvorm, object=voorwerp, complement=r
         wrap.innerHTML = `<div class="script-empty">Could not build script: ${escapeHtml(e.message || e)}<br><br>On the cloud site, paste a Gemini API key in the sidebar. On PC, run the local server with GEMINI_API_KEY in telegram-bot/.env.</div>`;
       } finally {
         btn.disabled = false;
+        if (rebuildBtn) rebuildBtn.disabled = false;
       }
     }
 
     document.getElementById("buildScript").addEventListener("click", () => buildScriptForCurrentTrack(false));
+    document.getElementById("rebuildScript").addEventListener("click", () => buildScriptForCurrentTrack(true));
 
     function playTrackEntry(folder, track, btn) {
       document.querySelectorAll(".track").forEach((t) => t.classList.remove("active"));
