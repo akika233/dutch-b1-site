@@ -382,15 +382,26 @@
       gap: 0.65rem;
       margin-bottom: 1rem;
     }
-    .explain-form textarea {
-      min-height: 8rem;
-      width: 100%;
+    .explain-form input[type="number"] {
+      width: 5rem;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 0.75rem 0.85rem;
+      border-radius: 10px;
+      padding: 0.4rem 0.55rem;
       font: inherit;
-      resize: vertical;
-      background: #fff;
+    }
+    .explain-preview {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #ece7de;
+      overflow: auto;
+      max-height: 42vh;
+      display: none;
+    }
+    .explain-preview.visible { display: block; }
+    .explain-preview img, .explain-preview canvas {
+      display: block;
+      width: 100%;
+      height: auto;
     }
     .answers-toolbar {
       display: flex;
@@ -698,7 +709,7 @@
             <div class="btn-row" id="stageActions">
               <button class="btn primary" type="button" id="buildScript">Build script for track</button>
               <button class="btn" type="button" id="rebuildScript">Rebuild complete</button>
-              <button class="btn primary" type="button" id="runExplain" hidden>Explain &amp; translate</button>
+              <button class="btn primary" type="button" id="runExplain" hidden>Explain this page</button>
               <button class="btn" type="button" id="openAnswers253" hidden>Open p.253</button>
               <a id="pdfOpenTab" href="#" target="_blank" rel="noopener">Open book tab</a>
             </div>
@@ -718,15 +729,23 @@
             <div class="script-wrap" id="explainWrap">
               <div class="explain-form">
                 <strong style="font-family:Fraunces,serif;">Explain &amp; translate</strong>
-                <p style="margin:0;color:var(--muted);font-size:0.92rem;">Paste Dutch text from the book page (e.g. “Wat is netwerken?”). You’ll get English + a short B1 explanation per sentence.</p>
-                <textarea id="explainInput" placeholder="Plak hier de Nederlandse tekst uit het boek…"></textarea>
-                <div class="btn-row">
-                  <button class="btn primary" type="button" id="runExplainInline">Explain &amp; translate</button>
-                  <button class="btn" type="button" id="clearExplain">Clear</button>
+                <p style="margin:0;color:var(--muted);font-size:0.92rem;">
+                  No copy-paste needed. Enter the book page number (same as in the PDF viewer), then screen the page.
+                  Gemini reads the article and explains it in English.
+                </p>
+                <div class="btn-row" style="align-items:center;">
+                  <label style="display:flex;align-items:center;gap:0.35rem;font-size:0.9rem;">
+                    Page
+                    <input type="number" id="explainPage" min="1" value="5" />
+                  </label>
+                  <button class="btn primary" type="button" id="runExplainInline">Screen page &amp; explain</button>
+                  <button class="btn" type="button" id="pickExplainPhotoBtn">Photo of page</button>
+                  <input type="file" id="pickExplainPhoto" accept="image/*" capture="environment" hidden />
                 </div>
+                <div class="explain-preview" id="explainPreview"></div>
               </div>
               <div id="explainResult">
-                <div class="script-empty">Paste text above, then run Explain.</div>
+                <div class="script-empty">Open a book in the sidebar, set the page, then tap <strong>Screen page &amp; explain</strong>.</div>
               </div>
             </div>
           </div>
@@ -759,6 +778,12 @@
     </div>
   </footer>
 
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    if (window["pdfjsLib"]) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    }
+  </script>
   <script>
     const CHAPTERS = [
       { id: 1, title: "Gisteren, vandaag, morgen", focus: "Self, plans · bijzin / indirecte rede" },
@@ -1123,14 +1148,53 @@
       setStage("script");
     }
 
-    async function explainWithGemini(text) {
-      const key = (localStorage.getItem(GEMINI_KEY_STORE) || "").trim();
+    const pdfDocCache = {}; // url -> pdfjs doc promise
+    let lastExplainImageB64 = null;
+
+    function getGeminiKey() {
+      return (localStorage.getItem(GEMINI_KEY_STORE) || "").trim();
+    }
+
+    async function loadPdfDoc(url) {
+      if (!window.pdfjsLib) throw new Error("PDF engine failed to load (pdf.js)");
+      if (!pdfDocCache[url]) {
+        pdfDocCache[url] = pdfjsLib.getDocument({ url, withCredentials: false }).promise;
+      }
+      return pdfDocCache[url];
+    }
+
+    async function renderPdfPageToJpeg(url, pageNum, scale) {
+      const doc = await loadPdfDoc(url);
+      const total = doc.numPages;
+      const n = Math.min(Math.max(1, parseInt(pageNum, 10) || 1), total);
+      const page = await doc.getPage(n);
+      const viewport = page.getViewport({ scale: scale || 1.6 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      const b64 = dataUrl.split(",")[1];
+      return { canvas, dataUrl, b64, page: n, total };
+    }
+
+    function showExplainPreview(dataUrl) {
+      const box = document.getElementById("explainPreview");
+      box.classList.add("visible");
+      box.innerHTML = `<img alt="Page preview" src="${dataUrl}" />`;
+    }
+
+    async function explainImageWithGemini(b64, mime) {
+      const key = getGeminiKey();
       if (!key) throw new Error("Add your Gemini API key in the sidebar first");
       const prompt = `You are a Dutch B1 tutor (Contact! NT2 style).
-Explain and translate the Dutch text for a B1 learner.
+Look at this screenshot/photo of a Dutch textbook page.
+1) Read the MAIN article / reading text (ignore exercise instructions, page numbers, tiny captions if they are not part of the article).
+2) Explain and translate it for a B1 learner.
 Return ONLY JSON:
-{"title":"short title","overview":"2-3 sentence overview in English","sentences":[{"nl":"Dutch sentence","en":"English","note":"short B1 tip: vocab or grammar in plain English"}]}
-Rules: keep every sentence; notes must be short and practical; no markdown.`;
+{"title":"short title from the article","overview":"2-3 sentence overview in English","sentences":[{"nl":"Dutch sentence","en":"English","note":"short B1 tip: vocab or grammar in plain English"}]}
+Rules: cover the full article in order; notes short and practical; no markdown.`;
       const models = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-2.0-flash"];
       let lastErr = null;
       for (const model of models) {
@@ -1139,7 +1203,12 @@ Rules: keep every sentence; notes must be short and practical; no markdown.`;
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt + "\n\nDUTCH TEXT:\n" + text }] }],
+              contents: [{
+                parts: [
+                  { text: prompt },
+                  { inline_data: { mime_type: mime || "image/jpeg", data: b64 } },
+                ],
+              }],
               generationConfig: { temperature: 0.2, responseMimeType: "application/json" },
             }),
           });
@@ -1161,7 +1230,7 @@ Rules: keep every sentence; notes must be short and practical; no markdown.`;
     function renderExplain(data) {
       const box = document.getElementById("explainResult");
       if (!data || !data.sentences || !data.sentences.length) {
-        box.innerHTML = `<div class="script-empty">No sentences returned.</div>`;
+        box.innerHTML = `<div class="script-empty">No sentences returned — try another page or a clearer photo.</div>`;
         return;
       }
       const title = data.title ? `<h3 style="margin:0 0 0.55rem;font-family:Fraunces,serif;">${escapeHtml(data.title)}</h3>` : "";
@@ -1173,38 +1242,73 @@ Rules: keep every sentence; notes must be short and practical; no markdown.`;
       box.innerHTML = title + overview + cards;
     }
 
-    async function runExplainFlow() {
-      const text = (document.getElementById("explainInput").value || "").trim();
-      if (!text) {
-        alert("Paste Dutch text from the book first.");
+    async function runExplainFromPage() {
+      setStage("explain");
+      if (!currentPdfEntry || !currentPdfEntry.url) {
+        alert("Open a book first (sidebar → Werkboek / Tekstboek).");
         return;
       }
-      setStage("explain");
+      const page = document.getElementById("explainPage").value || 1;
       const box = document.getElementById("explainResult");
-      const cacheKey = text.slice(0, 200);
+      const cacheKey = currentPdfEntry.name + "::" + page;
       if (explainCache[cacheKey]) {
         renderExplain(explainCache[cacheKey]);
         return;
       }
-      box.innerHTML = `<div class="script-empty">Explaining &amp; translating…</div>`;
+      box.innerHTML = `<div class="script-empty">Screening page ${escapeHtml(String(page))}…</div>`;
       const btns = [document.getElementById("runExplain"), document.getElementById("runExplainInline")];
       btns.forEach((b) => { if (b) b.disabled = true; });
       try {
-        const data = await explainWithGemini(text);
+        const shot = await renderPdfPageToJpeg(currentPdfEntry.url, page, 1.7);
+        lastExplainImageB64 = shot.b64;
+        showExplainPreview(shot.dataUrl);
+        document.getElementById("explainPage").value = shot.page;
+        box.innerHTML = `<div class="script-empty">Reading page ${shot.page} / ${shot.total} with Gemini…</div>`;
+        const data = await explainImageWithGemini(shot.b64, "image/jpeg");
         explainCache[cacheKey] = data;
         renderExplain(data);
       } catch (e) {
-        box.innerHTML = `<div class="script-empty">Could not explain: ${escapeHtml(e.message || e)}<br><br>Paste a Gemini API key in the sidebar (cloud) or use the local server with GEMINI_API_KEY.</div>`;
+        box.innerHTML = `<div class="script-empty">Could not explain page: ${escapeHtml(e.message || e)}<br><br>Make sure a book PDF is open and a Gemini API key is saved in the sidebar. Or use <strong>Photo of page</strong>.</div>`;
       } finally {
         btns.forEach((b) => { if (b) b.disabled = false; });
       }
     }
 
-    document.getElementById("runExplain").addEventListener("click", runExplainFlow);
-    document.getElementById("runExplainInline").addEventListener("click", runExplainFlow);
-    document.getElementById("clearExplain").addEventListener("click", () => {
-      document.getElementById("explainInput").value = "";
-      document.getElementById("explainResult").innerHTML = `<div class="script-empty">Paste text above, then run Explain.</div>`;
+    async function runExplainFromPhoto(file) {
+      setStage("explain");
+      const box = document.getElementById("explainResult");
+      box.innerHTML = `<div class="script-empty">Reading your photo…</div>`;
+      const btns = [document.getElementById("runExplain"), document.getElementById("runExplainInline")];
+      btns.forEach((b) => { if (b) b.disabled = true; });
+      try {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+        }
+        const b64 = btoa(binary);
+        const mime = file.type || "image/jpeg";
+        lastExplainImageB64 = b64;
+        showExplainPreview("data:" + mime + ";base64," + b64);
+        const data = await explainImageWithGemini(b64, mime);
+        renderExplain(data);
+      } catch (e) {
+        box.innerHTML = `<div class="script-empty">Could not explain photo: ${escapeHtml(e.message || e)}</div>`;
+      } finally {
+        btns.forEach((b) => { if (b) b.disabled = false; });
+      }
+    }
+
+    document.getElementById("runExplain").addEventListener("click", runExplainFromPage);
+    document.getElementById("runExplainInline").addEventListener("click", runExplainFromPage);
+    document.getElementById("pickExplainPhotoBtn").addEventListener("click", () => {
+      document.getElementById("pickExplainPhoto").click();
+    });
+    document.getElementById("pickExplainPhoto").addEventListener("change", () => {
+      const f = document.getElementById("pickExplainPhoto").files && document.getElementById("pickExplainPhoto").files[0];
+      if (f) runExplainFromPhoto(f);
     });
     document.getElementById("openAnswers253").addEventListener("click", () => {
       setStage("answers");
